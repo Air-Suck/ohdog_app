@@ -126,9 +126,9 @@ Header：`Content-Type: application/json`，`Authorization: Bearer <token>`（�
     {"op": "mode", "key": "v"},
     {"op": "vel", "fwd": 0.4, "side": 0.0, "yaw": 0.0, "duration_ms": 5000},
     {"op": "vel", "fwd": 0.0, "side": 0.0, "yaw": 0.0, "duration_ms": 300},
-    {"op": "mode", "key": "x"}
+    {"op": "mode", "key": "r"}
   ],
-  "msg": "stub: openclaw not deployed, fixed sequence"
+  "msg": "openclaw"
 }
 ```
 
@@ -153,7 +153,7 @@ Header：`Content-Type: application/json`，`Authorization: Bearer <token>`（�
 
 | op | 字段 | 说明 |
 |----|------|------|
-| `mode` | `key` ∈ `r\|x\|z\|v\|b\|j\|k` | 阻尼/空闲/站立/行走/后空翻/跳跃/挥手 |
+| `mode` | `key` ∈ `r\|z\|v\|b\|j\|k`（禁止 `x` 空闲，关节释放有安全风险） | 阻尼/站立/行走/后空翻/跳跃/挥手 |
 | `vel` | `fwd,side,yaw,duration_ms>0` | 速度段；手机约 100ms 周期下发，到期零速 |
 
 非法步 **整单拒绝**；超速钳位约 0.7/0.5/0.7 并打日志。当前联调全程用 **HTTP**（中间机↔910 由 SSH 加密，不必再在 910 上开 HTTPS）。对接 openclaw 时改 `910_server/main.cpp` 中 `plan_with_openclaw()`。

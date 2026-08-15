@@ -1,31 +1,42 @@
 /**
- * Ascend 910 端云协同 — 薄 HTTP(S) 规划服务（连通性测试桩）
+ * Ascend 910 端云协同 — 薄 HTTP(S) 规划服务
  *
  * 职责：
  *   1) 监听端口，接收手机 POST /v1/plan（自然语言指令）
  *   2) 规划侧常驻 kMetaActionSystemPrompt（元操作字典）；手机不传字典
- *   3) 当前 openclaw/ibrobot 未部署：仍返回固定 stub 序列（连通性）
- *   4) 日后在 plan_with_openclaw() 中把 system+user 交给 openclaw 即可
+ *   3) 调用本机 OpenClaw：POST http://127.0.0.1:18789/v1/chat/completions
+ *      model=openclaw/default；从 choices[0].message.content 取规划结果
+ *   4) 将模型输出解析为 actions 数组或 beyond_capability，再返回给上游
  *
  * 协议（JSON UTF-8）：
  *   POST /v1/plan
  *     Header: Authorization: Bearer <token>   （可用环境变量 NPU_TOKEN，默认 robotpi）
  *             Content-Type: application/json
  *     Body:   {"v":1,"request_id":"...","text":"..."}
- *     Resp:   {"v":1,"request_id":"...","ok":true,"actions":[...],"msg":"stub"}
+ *     Resp:   {"v":1,"request_id":"...","ok":true,"actions":[...],"msg":"..."}
  *
  *   GET /health  →  {"ok":true,"service":"npu_plan_server"}
  *
+ * 环境变量：
+ *   NPU_PORT / NPU_TOKEN — 本服务监听与鉴权
+ *   OPENCLAW_URL         — 默认 http://127.0.0.1:18789/v1/chat/completions
+ *   OPENCLAW_TIMEOUT_SEC — 调用超时秒数，默认 600
+ *   NPU_STUB=1           — 强制走本地 stub（不调 OpenClaw，便于断网联调）
+ *
  * 编译 / 运行见同目录 Makefile 与 docs/910_server_support.md
+ * OpenClaw 协议见 delivery/OPENCLAW_HTTP_CHAT.md
  */
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <csignal>
 #include <cstring>
@@ -47,6 +58,11 @@ constexpr int kDefaultPort = 8443;
 
 /** 默认鉴权 token，可用环境变量 NPU_TOKEN 覆盖 */
 constexpr const char* kDefaultToken = "robotpi";
+
+/** OpenClaw Chat Completions（仅本机 loopback；见 OPENCLAW_HTTP_CHAT.md） */
+constexpr const char* kDefaultOpenClawUrl = "http://127.0.0.1:18789/v1/chat/completions";
+constexpr const char* kOpenClawModel = "openclaw/default";
+constexpr int kDefaultOpenClawTimeoutSec = 600;
 
 std::atomic<bool> g_running{true};
 
@@ -96,15 +112,84 @@ int env_port() {
   return (p > 0 && p < 65536) ? p : kDefaultPort;
 }
 
-/** 简易 JSON 字符串转义（仅处理引号与反斜杠） */
+int env_openclaw_timeout_sec() {
+  const char* v = std::getenv("OPENCLAW_TIMEOUT_SEC");
+  if (!v || !*v) {
+    return kDefaultOpenClawTimeoutSec;
+  }
+  int t = std::atoi(v);
+  return (t > 0 && t <= 3600) ? t : kDefaultOpenClawTimeoutSec;
+}
+
+bool env_stub_mode() {
+  const char* v = std::getenv("NPU_STUB");
+  return v && (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 ||
+               std::strcmp(v, "TRUE") == 0);
+}
+
+/** JSON 字符串转义（含控制字符，便于嵌入 OpenClaw 请求体） */
 std::string json_escape(const std::string& s) {
   std::string out;
-  out.reserve(s.size() + 8);
-  for (char c : s) {
-    if (c == '\\' || c == '"') {
-      out.push_back('\\');
+  out.reserve(s.size() + 16);
+  for (unsigned char c : s) {
+    switch (c) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '"':
+        out += "\\\"";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        if (c < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+          out += buf;
+        } else {
+          out.push_back(static_cast<char>(c));
+        }
+        break;
     }
-    out.push_back(c);
+  }
+  return out;
+}
+
+/** 反转义 JSON 字符串内容（仅处理常见转义） */
+std::string json_unescape(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '\\' && i + 1 < s.size()) {
+      const char n = s[i + 1];
+      if (n == '"' || n == '\\' || n == '/') {
+        out.push_back(n);
+        ++i;
+      } else if (n == 'n') {
+        out.push_back('\n');
+        ++i;
+      } else if (n == 'r') {
+        out.push_back('\r');
+        ++i;
+      } else if (n == 't') {
+        out.push_back('\t');
+        ++i;
+      } else if (n == 'u' && i + 5 < s.size()) {
+        // 粗略跳过 \\uXXXX（元操作 JSON 一般不含）
+        i += 5;
+      } else {
+        out.push_back(s[i]);
+      }
+    } else {
+      out.push_back(s[i]);
+    }
   }
   return out;
 }
@@ -144,6 +229,68 @@ std::string extract_json_string(const std::string& body, const std::string& key)
   return body.substr(pos + 1, end - pos - 1);
 }
 
+/** 在 from 之后查找字符串字段；找不到返回空。 */
+std::string extract_json_string_after(const std::string& body, size_t from,
+                                      const std::string& key) {
+  const std::string pat = "\"" + key + "\"";
+  size_t pos = body.find(pat, from);
+  if (pos == std::string::npos) {
+    return "";
+  }
+  pos = body.find(':', pos + pat.size());
+  if (pos == std::string::npos) {
+    return "";
+  }
+  pos = body.find('"', pos + 1);
+  if (pos == std::string::npos) {
+    return "";
+  }
+  size_t end = pos + 1;
+  while (end < body.size()) {
+    if (body[end] == '\\' && end + 1 < body.size()) {
+      end += 2;
+      continue;
+    }
+    if (body[end] == '"') {
+      break;
+    }
+    ++end;
+  }
+  if (end >= body.size()) {
+    return "";
+  }
+  return body.substr(pos + 1, end - pos - 1);
+}
+
+std::string trim_ws(const std::string& s) {
+  size_t b = 0;
+  while (b < s.size() && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r' || s[b] == '\n')) {
+    ++b;
+  }
+  size_t e = s.size();
+  while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r' || s[e - 1] == '\n')) {
+    --e;
+  }
+  return s.substr(b, e - b);
+}
+
+/** 去掉模型偶发的 markdown 代码围栏。 */
+std::string strip_markdown_fence(std::string s) {
+  s = trim_ws(s);
+  if (s.size() >= 3 && s.compare(0, 3, "```") == 0) {
+    size_t nl = s.find('\n');
+    if (nl != std::string::npos) {
+      s = s.substr(nl + 1);
+    }
+    size_t end = s.rfind("```");
+    if (end != std::string::npos) {
+      s = s.substr(0, end);
+    }
+    s = trim_ws(s);
+  }
+  return s;
+}
+
 /**
  * 常驻系统提示：元操作库（与 task/910_server.md / docs/910_server_support.md 一致）。
  * 对接 openclaw / LLM 时作为 system（或等价）prompt；手机请求体只带用户自然语言，不附带本字典。
@@ -153,16 +300,17 @@ static const char kMetaActionSystemPrompt[] = R"META(
 
 【元操作字典】仅允许两种 op，不得发明其它 op / 字段：
 1) mode — {"op":"mode","key":"<k>"}
-   合法 key：r 阻尼；x 空闲；z 站立；v 行走；b 后空翻；j 跳跃；k 挥手
+   合法 key：r 阻尼；z 站立；v 行走；b 后空翻；j 跳跃；k 挥手
+   禁止 key=x（空闲）：该模式会释放关节，存在安全隐患，规划结果中不得出现
 2) vel — {"op":"vel","fwd":<f>,"side":<f>,"yaw":<f>,"duration_ms":<n>}
    坐标系：fwd>0 前进、<0 后退；side>0 左移、<0 右移；yaw>0 左转、<0 右转
    duration_ms 必须为 >0 的整数；建议 |fwd|≤0.7、|side|≤0.5、|yaw|≤0.7
    距离类指令用「名义速度×时长」近似，勿发明 distance 字段
 
 【规划约束】
-- 非零 vel 前通常先 {"op":"mode","key":"v"}；结束可视需要 {"op":"mode","key":"x"}
+- 非零 vel 前通常先 {"op":"mode","key":"v"}；结束可视需要切回阻尼 {"op":"mode","key":"r"}（勿用 x）
 - 能用字典完成时：只输出一个 JSON 数组（不要 markdown、不要解释），例如：
-  [{"op":"mode","key":"v"},{"op":"vel","fwd":0.4,"side":0.0,"yaw":0.0,"duration_ms":5000},{"op":"mode","key":"x"}]
+  [{"op":"mode","key":"v"},{"op":"vel","fwd":0.4,"side":0.0,"yaw":0.0,"duration_ms":5000},{"op":"mode","key":"r"}]
 
 【超出能力】
 若任务无法仅用上述 mode/vel 可靠完成（例如：开门、抓取、飞行、游泳、精确地图导航、语音对话、识别特定物体后操作、爬楼梯闭环等），
@@ -173,13 +321,167 @@ static const char kMetaActionSystemPrompt[] = R"META(
 /** 规划结果：成功带 actions；超出能力时 ok=false 且 actions 为空数组。 */
 struct PlanResult {
   bool ok = false;
-  std::string reason;       // 成功可空；失败常用 beyond_capability
+  std::string reason;       // 成功可空；失败常用 beyond_capability / openclaw_error
   std::string actions_json; // 成功为 [...] ；失败为 []
   std::string msg;
 };
 
+struct HttpClientResult {
+  bool ok = false;
+  int status = 0;
+  std::string body;
+  std::string error;
+};
+
+/** 解析 http://host:port/path 形式的 URL（仅支持 http，供本机 OpenClaw 使用）。 */
+bool parse_http_url(const std::string& url, std::string& host, int& port, std::string& path) {
+  const std::string prefix = "http://";
+  if (url.compare(0, prefix.size(), prefix) != 0) {
+    return false;
+  }
+  std::string rest = url.substr(prefix.size());
+  size_t slash = rest.find('/');
+  std::string hostport = (slash == std::string::npos) ? rest : rest.substr(0, slash);
+  path = (slash == std::string::npos) ? "/" : rest.substr(slash);
+  if (hostport.empty()) {
+    return false;
+  }
+  size_t colon = hostport.find(':');
+  if (colon == std::string::npos) {
+    host = hostport;
+    port = 80;
+  } else {
+    host = hostport.substr(0, colon);
+    port = std::atoi(hostport.c_str() + colon + 1);
+    if (port <= 0 || port >= 65536) {
+      return false;
+    }
+  }
+  return !host.empty() && !path.empty();
+}
+
 /**
- * 固定元动作序列（连通性 stub）。
+ * 向本机 OpenClaw 发非流式 HTTP POST。
+ * 使用原始套接字，避免引入 libcurl；超时默认 600s（Agent 可能较慢）。
+ */
+HttpClientResult http_post_json(const std::string& url, const std::string& json_body,
+                                int timeout_sec) {
+  HttpClientResult r;
+  std::string host;
+  int port = 0;
+  std::string path;
+  if (!parse_http_url(url, host, port, path)) {
+    r.error = "invalid OPENCLAW_URL (expect http://host:port/path)";
+    return r;
+  }
+
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    r.error = std::string("socket: ") + std::strerror(errno);
+    return r;
+  }
+
+  timeval tv{};
+  tv.tv_sec = timeout_sec > 0 ? timeout_sec : kDefaultOpenClawTimeoutSec;
+  tv.tv_usec = 0;
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<uint16_t>(port));
+  if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+    ::close(fd);
+    r.error = "inet_pton failed for host=" + host;
+    return r;
+  }
+
+  if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+    r.error = std::string("connect ") + host + ":" + std::to_string(port) + ": " +
+              std::strerror(errno);
+    ::close(fd);
+    return r;
+  }
+
+  std::ostringstream req;
+  req << "POST " << path << " HTTP/1.1\r\n"
+      << "Host: " << host << ":" << port << "\r\n"
+      << "Content-Type: application/json\r\n"
+      << "Accept: application/json\r\n"
+      << "Connection: close\r\n"
+      << "Content-Length: " << json_body.size() << "\r\n"
+      << "\r\n"
+      << json_body;
+  const std::string req_s = req.str();
+
+  size_t sent = 0;
+  while (sent < req_s.size()) {
+    ssize_t n = ::send(fd, req_s.data() + sent, req_s.size() - sent, 0);
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      r.error = std::string("send: ") + std::strerror(errno);
+      ::close(fd);
+      return r;
+    }
+    if (n == 0) {
+      r.error = "send: connection closed";
+      ::close(fd);
+      return r;
+    }
+    sent += static_cast<size_t>(n);
+  }
+
+  std::string raw;
+  char buf[4096];
+  while (true) {
+    ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        r.error = "recv timeout waiting for OpenClaw";
+      } else {
+        r.error = std::string("recv: ") + std::strerror(errno);
+      }
+      ::close(fd);
+      return r;
+    }
+    if (n == 0) {
+      break;
+    }
+    raw.append(buf, static_cast<size_t>(n));
+    if (raw.size() > 8 * 1024 * 1024) {
+      r.error = "OpenClaw response too large";
+      ::close(fd);
+      return r;
+    }
+  }
+  ::close(fd);
+
+  const size_t hdr_end = raw.find("\r\n\r\n");
+  if (hdr_end == std::string::npos) {
+    r.error = "OpenClaw response missing HTTP header end";
+    return r;
+  }
+  const std::string status_line = raw.substr(0, raw.find("\r\n"));
+  // HTTP/1.1 200 OK
+  size_t sp1 = status_line.find(' ');
+  if (sp1 != std::string::npos) {
+    r.status = std::atoi(status_line.c_str() + sp1 + 1);
+  }
+  r.body = raw.substr(hdr_end + 4);
+  r.ok = (r.status >= 200 && r.status < 300);
+  if (!r.ok && r.error.empty()) {
+    r.error = "OpenClaw HTTP status=" + std::to_string(r.status);
+  }
+  return r;
+}
+
+/**
+ * 固定元动作序列（NPU_STUB=1 时使用）。
  * 起立(z) → 原地等待约 5s → 阻尼(r)。
  */
 std::string stub_actions_json() {
@@ -192,7 +494,7 @@ std::string stub_actions_json() {
 
 /**
  * Stub 侧粗判：明显超出当前 mode/vel 能力时返回 true。
- * 正式环境由 openclaw 按 kMetaActionSystemPrompt 判定；此处仅便于联调「超出能力」路径。
+ * 正式环境由 openclaw 按 kMetaActionSystemPrompt 判定。
  */
 bool stub_looks_beyond_capability(const std::string& text) {
   static const char* kHints[] = {
@@ -209,6 +511,22 @@ bool stub_looks_beyond_capability(const std::string& text) {
   return false;
 }
 
+PlanResult plan_with_stub(const std::string& text) {
+  PlanResult r;
+  if (stub_looks_beyond_capability(text)) {
+    r.ok = false;
+    r.reason = "beyond_capability";
+    r.actions_json = "[]";
+    r.msg = "超出当前元操作库能力：仅支持模式切换(mode)与速度段(vel)，无法完成该指令所要求的操作";
+    std::cout << "[npu] stub plan reject: beyond_capability" << std::endl;
+    return r;
+  }
+  r.ok = true;
+  r.actions_json = stub_actions_json();
+  r.msg = "stub: stand(z) → wait 5s → damp(r)";
+  return r;
+}
+
 /** 拼给模型的用户侧消息：仅本轮自然语言（字典与超出能力规则在 system prompt）。 */
 std::string build_openclaw_user_message(const std::string& text) {
   std::ostringstream oss;
@@ -218,42 +536,211 @@ std::string build_openclaw_user_message(const std::string& text) {
   return oss.str();
 }
 
+/** 组装 OpenClaw Chat Completions 请求体（非流式）。 */
+std::string build_openclaw_request_body(const std::string& conversation_id,
+                                        const std::string& user_msg) {
+  std::ostringstream oss;
+  oss << "{"
+      << "\"model\":\"" << kOpenClawModel << "\","
+      << "\"stream\":false,";
+  if (!conversation_id.empty()) {
+    oss << "\"user\":\"conversation:" << json_escape(conversation_id) << "\",";
+  }
+  oss << "\"messages\":["
+      << "{\"role\":\"system\",\"content\":\"" << json_escape(kMetaActionSystemPrompt) << "\"},"
+      << "{\"role\":\"user\",\"content\":\"" << json_escape(user_msg) << "\"}"
+      << "]"
+      << "}";
+  return oss.str();
+}
+
 /**
- * 对接 openclaw / ibrobot：system = kMetaActionSystemPrompt，user = 用户原文。
- * 当前未部署：能力内返回 stub 序列；命中 stub 超能力关键词则返回 beyond_capability。
+ * 从 OpenClaw Chat Completions JSON 中取出 choices[0].message.content。
+ * 同时校验 finish_reason（允许 stop；length 视为截断错误）。
  */
-PlanResult plan_with_openclaw(const std::string& text) {
+bool extract_openclaw_reply(const std::string& response_json, std::string& content_out,
+                            std::string& finish_reason_out, std::string& request_id_out,
+                            std::string& err_out) {
+  request_id_out = json_unescape(extract_json_string(response_json, "id"));
+
+  const size_t choices_pos = response_json.find("\"choices\"");
+  if (choices_pos == std::string::npos) {
+    err_out = "OpenClaw 响应中没有 choices";
+    return false;
+  }
+
+  finish_reason_out = extract_json_string_after(response_json, choices_pos, "finish_reason");
+  const std::string raw_content =
+      extract_json_string_after(response_json, choices_pos, "content");
+  if (raw_content.empty()) {
+    // 有时 finish_reason 在 content 之后；再全局兜底一次
+    const std::string fallback = extract_json_string(response_json, "content");
+    if (fallback.empty()) {
+      err_out = "OpenClaw 响应中没有 message.content";
+      return false;
+    }
+    content_out = trim_ws(json_unescape(fallback));
+  } else {
+    content_out = trim_ws(json_unescape(raw_content));
+  }
+
+  if (finish_reason_out == "length") {
+    err_out = "OpenClaw 回答因 token 限制被截断";
+    return false;
+  }
+  if (!finish_reason_out.empty() && finish_reason_out != "stop") {
+    err_out = "OpenClaw 返回非预期 finish_reason: " + finish_reason_out;
+    return false;
+  }
+  if (content_out.empty()) {
+    err_out = "OpenClaw 返回了空回答";
+    return false;
+  }
+  return true;
+}
+
+/**
+ * 将模型输出解析为 PlanResult。
+ * 期望：纯 JSON 数组（actions）或 beyond_capability 对象。
+ */
+PlanResult parse_plan_from_model_reply(const std::string& reply) {
+  PlanResult r;
+  const std::string text = strip_markdown_fence(reply);
+  if (text.empty()) {
+    r.ok = false;
+    r.reason = "openclaw_error";
+    r.actions_json = "[]";
+    r.msg = "模型返回空内容";
+    return r;
+  }
+
+  if (text[0] == '[') {
+    // 粗校验：应以 ] 结束
+    if (text.back() != ']') {
+      r.ok = false;
+      r.reason = "openclaw_error";
+      r.actions_json = "[]";
+      r.msg = "模型返回的 actions 不是完整 JSON 数组";
+      return r;
+    }
+    r.ok = true;
+    r.actions_json = text;
+    r.msg = "openclaw";
+    return r;
+  }
+
+  if (text[0] == '{') {
+    const std::string reason = extract_json_string(text, "reason");
+    const std::string msg = json_unescape(extract_json_string(text, "msg"));
+    const bool looks_reject =
+        text.find("\"ok\":false") != std::string::npos ||
+        text.find("\"ok\": false") != std::string::npos ||
+        reason == "beyond_capability";
+    if (looks_reject) {
+      r.ok = false;
+      r.reason = reason.empty() ? "beyond_capability" : reason;
+      r.actions_json = "[]";
+      r.msg = msg.empty()
+                  ? "超出当前元操作库能力：仅支持模式切换(mode)与速度段(vel)"
+                  : msg;
+      return r;
+    }
+  }
+
+  r.ok = false;
+  r.reason = "openclaw_error";
+  r.actions_json = "[]";
+  r.msg = "无法解析模型输出（既非 actions 数组也非 beyond_capability）: " +
+          text.substr(0, 200);
+  return r;
+}
+
+/**
+ * 对接 OpenClaw：system = kMetaActionSystemPrompt，user = 用户原文。
+ * 请求 http://127.0.0.1:18789/v1/chat/completions ，model=openclaw/default。
+ * 设置 NPU_STUB=1 可回退到本地固定序列。
+ */
+PlanResult plan_with_openclaw(const std::string& text, const std::string& request_id) {
   const std::string user_msg = build_openclaw_user_message(text);
   std::cout << "[npu] plan prompt ready: system_chars="
             << (sizeof(kMetaActionSystemPrompt) - 1)
             << " user_chars=" << user_msg.size()
-            << " text=\"" << text << "\"" << std::endl;
-  // TODO: 调用 openclaw+ibrobot：
-  //   system = kMetaActionSystemPrompt
-  //   user   = user_msg
-  //   若模型返回 beyond_capability 对象 → PlanResult{ok=false,...}
-  //   若模型返回 actions 数组 → PlanResult{ok=true, actions_json=...}
-  (void)user_msg;
+            << " text=\"" << text << "\""
+            << " request_id=\"" << request_id << "\"" << std::endl;
 
-  PlanResult r;
-  if (stub_looks_beyond_capability(text)) {
+  if (env_stub_mode()) {
+    std::cout << "[npu] NPU_STUB=1 → local stub planner" << std::endl;
+    return plan_with_stub(text);
+  }
+
+  const std::string url = env_or("OPENCLAW_URL", kDefaultOpenClawUrl);
+  const int timeout_sec = env_openclaw_timeout_sec();
+  const std::string conv_id = request_id.empty() ? "anon" : request_id;
+  const std::string payload = build_openclaw_request_body(conv_id, user_msg);
+
+  std::cout << "[npu] openclaw POST " << url << " model=" << kOpenClawModel
+            << " user=conversation:" << conv_id
+            << " timeout_sec=" << timeout_sec
+            << " payload_bytes=" << payload.size() << std::endl;
+
+  const auto t0 = std::chrono::steady_clock::now();
+  const HttpClientResult http = http_post_json(url, payload, timeout_sec);
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+
+  if (!http.ok) {
+    PlanResult r;
     r.ok = false;
-    r.reason = "beyond_capability";
+    r.reason = "openclaw_error";
     r.actions_json = "[]";
-    r.msg = "超出当前元操作库能力：仅支持模式切换(mode)与速度段(vel)，无法完成该指令所要求的操作";
-    std::cout << "[npu] plan reject: beyond_capability" << std::endl;
+    std::ostringstream msg;
+    msg << "OpenClaw 调用失败: " << http.error;
+    if (http.status > 0) {
+      msg << " status=" << http.status;
+    }
+    if (!http.body.empty()) {
+      msg << " body=" << http.body.substr(0, 500);
+    }
+    r.msg = msg.str();
+    std::cout << "[npu] openclaw error after " << ms << "ms: " << r.msg << std::endl;
     return r;
   }
-  r.ok = true;
-  r.reason = "";
-  r.actions_json = stub_actions_json();
-  r.msg = "stub: stand(z) → wait 5s → damp(r)";
-  return r;
+
+  std::string content;
+  std::string finish_reason;
+  std::string oc_id;
+  std::string extract_err;
+  if (!extract_openclaw_reply(http.body, content, finish_reason, oc_id, extract_err)) {
+    PlanResult r;
+    r.ok = false;
+    r.reason = "openclaw_error";
+    r.actions_json = "[]";
+    r.msg = extract_err + " body=" + http.body.substr(0, 500);
+    std::cout << "[npu] openclaw parse error after " << ms << "ms: " << extract_err
+              << " id=" << oc_id << std::endl;
+    return r;
+  }
+
+  std::cout << "[npu] openclaw ok after " << ms << "ms id=" << oc_id
+            << " finish_reason=" << finish_reason
+            << " reply_chars=" << content.size() << std::endl;
+  std::cout << "[npu] openclaw reply: " << content.substr(0, 500)
+            << (content.size() > 500 ? "..." : "") << std::endl;
+
+  PlanResult plan = parse_plan_from_model_reply(content);
+  if (plan.ok) {
+    std::cout << "[npu] plan accept: actions from openclaw" << std::endl;
+  } else {
+    std::cout << "[npu] plan reject: reason=" << plan.reason << " msg=" << plan.msg
+              << std::endl;
+  }
+  return plan;
 }
 
 std::string build_plan_response(const std::string& request_id, const std::string& text) {
   const std::string rid = request_id.empty() ? "anon" : request_id;
-  const PlanResult plan = plan_with_openclaw(text);
+  const PlanResult plan = plan_with_openclaw(text, rid);
   std::ostringstream oss;
   oss << "{"
       << "\"v\":1,"
@@ -520,12 +1007,13 @@ void print_usage(const char* argv0) {
       << " [--cert pem --key pem]"
 #endif
       << "\n"
-      << "  Env: NPU_PORT NPU_TOKEN"
+      << "  Env: NPU_PORT NPU_TOKEN OPENCLAW_URL OPENCLAW_TIMEOUT_SEC NPU_STUB"
 #if defined(NPU_ENABLE_TLS)
       << " NPU_CERT NPU_KEY"
 #endif
       << "\n"
-      << "  Default: port " << kDefaultPort << ", token \"" << kDefaultToken << "\"\n";
+      << "  Default: port " << kDefaultPort << ", token \"" << kDefaultToken << "\"\n"
+      << "  OpenClaw: " << kDefaultOpenClawUrl << " model=" << kOpenClawModel << "\n";
 }
 
 }  // namespace
@@ -609,7 +1097,14 @@ int main(int argc, char** argv) {
 #endif
 
   std::cout << "[npu] token configured, POST /v1/plan  GET /health" << std::endl;
-  std::cout << "[npu] stub mode: fixed meta-action sequence (openclaw TBD)" << std::endl;
+  if (env_stub_mode()) {
+    std::cout << "[npu] planner=stub (NPU_STUB=1)" << std::endl;
+  } else {
+    std::cout << "[npu] planner=openclaw url="
+              << env_or("OPENCLAW_URL", kDefaultOpenClawUrl)
+              << " model=" << kOpenClawModel
+              << " timeout_sec=" << env_openclaw_timeout_sec() << std::endl;
+  }
 
   while (g_running) {
     sockaddr_in cli{};

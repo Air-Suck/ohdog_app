@@ -24,7 +24,7 @@
  *   - TCP hello:     {"type":"hello","token":"..."}
  *   - TCP hello_ack: {"type":"hello_ack","ok":true/false, ...}
  *   - TCP vel:       {"type":"vel","fwd":f,"side":f,"yaw":f}
- *   - TCP mode:      {"type":"mode","key":"r|x|z|v|b|j|k"}
+ *   - TCP mode:      {"type":"mode","key":"r|z|v|b|j|k"}（云端规划禁止 x 空闲；手动控狗仍可发 x）
  *   - TCP switch:    {"type":"switch","mode":0|1|2|3}  // RemoteCommandType
  *   - NPU plan:      POST {base}/v1/plan  Authorization: Bearer <token>
  *                    body {"v":1,"request_id":"...","text":"..."}
@@ -124,8 +124,11 @@ const NPU_BEARER_TOKEN: string = 'robotpi';
 const NPU_CONNECT_TIMEOUT_MS: number = 15000;
 const NPU_READ_TIMEOUT_MS: number = 60000;
 
-/** 合法 mode.key 集合（与狗端 / 元操作字典一致） */
-const META_MODE_KEYS: string[] = ['r', 'x', 'z', 'v', 'b', 'j', 'k'];
+/**
+ * 云端规划允许的 mode.key（与 910 元操作字典一致）。
+ * 不含 x（空闲）：该模式释放关节，规划序列禁止；手动 ModeBtn 仍可单独下发。
+ */
+const META_MODE_KEYS: string[] = ['r', 'z', 'v', 'b', 'j', 'k'];
 
 /**
  * 控制外设类型（与狗端 types::RemoteCommandType 数值一致）。
@@ -1618,7 +1621,7 @@ struct IpDogCtrl {
 
   /**
    * 发送模式切换按键（与狗端键盘接口字母一致）：
-   * r 阻尼 / x 空闲 / z 站立 / v 行走 / b 后空翻 / j 跳跃 / k 挥手
+   * r 阻尼 / x 空闲(仅手动，云端规划禁止) / z 站立 / v 行走 / b 后空翻 / j 跳跃 / k 挥手
    * 先强制摇杆回中并锁定，再发 mode，与狗端「清零 + 忽略杆量直到回中」对齐。
    */
   async sendModeKey(key: string): Promise<void> {

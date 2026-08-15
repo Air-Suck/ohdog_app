@@ -20,7 +20,7 @@ phone/android/
 | 发现 | UDP 广播 `{"type":"discover",...}` → 端口 **9871** |
 | 宣告 | 收 `{"type":"announce","ip","port","token","name"}` |
 | 连接 | TCP 连 announce 的 ip:port，发 `hello` |
-| 控狗 | `vel`（100ms 周期按住发送）、`mode`（r/x/z/v/b/j/k） |
+| 控狗 | `vel`（100ms 周期按住发送）、`mode`（r/z/v/b/j/k；云端规划禁止 x 空闲） |
 
 ## 用 Android Studio 打开
 
