@@ -1,5 +1,5 @@
 /**
- * 机器狗局域网控狗（手机 / 平板）
+ * 机器狗局域网控狗（手机 / 平板）+ 云端 910 自然语言规划
  *
  * =============================================================================
  * 通信流程概览
@@ -10,6 +10,12 @@
  *   4) 鉴权成功后：双虚拟摇杆连续下发 vel；模式键一次性下发 mode
  *      点模式键时前端强制摇杆回中，松手前不再发非零 vel（与狗端门控一致）
  *   5) 「切换到键盘」→ TCP switch，将控制权交给键盘外设后断开手机 TCP
+ *   6) 端云与狗机鉴权解耦：可先连狗或先请求 910。
+ *      自然语言 → HTTP POST /v1/plan → 校验元动作整单；
+ *      已鉴权狗机时按序 mode/vel 下发；未鉴权则仅展示规划结果，不下发。
+ *      急停进入保护模式（需已连狗才能真正零速/阻尼）
+ *   7) 「语音」→ CoreSpeechKit 麦克风听写，结果写入自然语言框（需 MICROPHONE）
+ *   8) 「调试模式」→ 页内显示 910 返回；校验通过后需手动「下发到狗」（不自动执行）
  *
  * 协议细节：
  *   - 报文均为 UTF-8 JSON 文本行，以 '\n' 结尾（TCP 侧按行缓冲解析）
@@ -20,9 +26,14 @@
  *   - TCP vel:       {"type":"vel","fwd":f,"side":f,"yaw":f}
  *   - TCP mode:      {"type":"mode","key":"r|x|z|v|b|j|k"}
  *   - TCP switch:    {"type":"switch","mode":0|1|2|3}  // RemoteCommandType
+ *   - NPU plan:      POST {base}/v1/plan  Authorization: Bearer <token>
+ *                    body {"v":1,"request_id":"...","text":"..."}
+ *                    resp {"v":1,"request_id":"...","ok":true,"actions":[...],"msg":"..."}
  *
  * 权限：module.json5 需声明 ohos.permission.INTERNET（system_grant，安装时自动授权，
  *       勿对 INTERNET 调用 requestPermissionsFromUser，否则会误报拒绝）。
+ *       语音识别需 ohos.permission.MICROPHONE（user_grant，点击「语音」时动态申请；
+ *       reason 建议 $string:mic_reason）。
  *
  * 坐标系约定（与狗端键盘接口一致）：
  *   fwd  > 0 前进，< 0 后退
@@ -32,12 +43,17 @@
  * 切模式安全：点模式 → 摇杆 UI 回中 + 发零速；手指未抬起前忽略拨杆，
  * 双杆均松手后才重新接受速度（狗端同步忽略非零 vel 直至收到全零）。
  *
+ * 保护模式：急停后停序列、零速、阻尼 mode=r，锁定摇杆/NL/模式直至用户点「解除保护」。
+ *
  * RemoteCommandType（与狗端 types::RemoteCommandType 一致）：
  *   0 = kIdleMode，1 = kKeyBoard，2 = kRetroidGamepad，3 = kOhPhone
  */
-import { socket } from '@kit.NetworkKit';
+import { http, socket } from '@kit.NetworkKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { util } from '@kit.ArkTS';
+import { abilityAccessCtrl, common, Permissions } from '@kit.AbilityKit';
+import { speechRecognizer } from '@kit.CoreSpeechKit';
+// 语音：CoreSpeechKit 实时听写；module.json5 须声明 MICROPHONE + mic_reason 字符串资源。
 
 // ---------------------------------------------------------------------------
 // 常量：发现 / 控速 / 速度上限
@@ -45,6 +61,12 @@ import { util } from '@kit.ArkTS';
 
 /** 日志与调试输出前缀 */
 const TAG: string = '[DogIpCtrl]';
+
+/** 语音识别会话 id（finish / cancel 时复用） */
+const VOICE_SESSION_ID: string = 'dog-nl-voice';
+
+/** 麦克风权限名 */
+const PERM_MICROPHONE: Permissions = 'ohos.permission.MICROPHONE';
 
 /** 狗端 UDP 发现服务监听端口；手机向该端口广播 discover */
 const UDP_PORT: number = 9871;
@@ -89,6 +111,23 @@ const JOYSTICK_TRAVEL: number = (JOYSTICK_SIZE - JOYSTICK_KNOB) / 2;
 const JOYSTICK_DEADZONE: number = 0.08;
 
 /**
+ * 云端 910 规划服务根地址（不含路径）。
+ * 联调：填中间机局域网地址，如 http://192.168.1.20:8443（先跑 mid/ssh_tunnel.sh）。
+ * 勿填 ModelArts 出口 NAT IP。仅本机调试隧道时可暂用 127.0.0.1。
+ */
+const NPU_BASE_URL: string = 'http://127.0.0.1:8443';
+
+/** 与 910 服务 NPU_TOKEN / --token 一致 */
+const NPU_BEARER_TOKEN: string = 'robotpi';
+
+/** POST /v1/plan 连接与读超时（推理可能较慢，预留余量） */
+const NPU_CONNECT_TIMEOUT_MS: number = 15000;
+const NPU_READ_TIMEOUT_MS: number = 60000;
+
+/** 合法 mode.key 集合（与狗端 / 元操作字典一致） */
+const META_MODE_KEYS: string[] = ['r', 'x', 'z', 'v', 'b', 'j', 'k'];
+
+/**
  * 控制外设类型（与狗端 types::RemoteCommandType 数值一致）。
  * switch 报文的 mode 字段使用这些常量。
  */
@@ -96,6 +135,19 @@ const REMOTE_IDLE: number = 0;             // kIdleMode
 const REMOTE_KEYBOARD: number = 1;         // kKeyBoard
 const REMOTE_RETROID_GAMEPAD: number = 2;  // kRetroidGamepad
 const REMOTE_OH_PHONE: number = 3;         // kOhPhone（本 App）
+
+/**
+ * 910 返回的单步元动作（校验通过后才执行）。
+ * op=mode 时用 key；op=vel 时用 fwd/side/yaw/duration_ms。
+ */
+class MetaAction {
+  op: string = '';
+  key: string = '';
+  fwd: number = 0;
+  side: number = 0;
+  yaw: number = 0;
+  duration_ms: number = 0;
+}
 
 function remoteCommandLabel(mode: number): string {
   if (mode === REMOTE_KEYBOARD) {
@@ -176,10 +228,50 @@ struct IpDogCtrl {
   /** 正在交接控制源，防止连点 */
   @State isSwitchingRemote: boolean = false;
 
+  /**
+   * 保护模式：急停后为 true。
+   * 期间拒绝摇杆/模式/自然语言下发，直至用户点「解除保护」。
+   */
+  @State isProtectMode: boolean = false;
+
+  /** 自然语言指令输入框内容 */
+  @State nlText: string = '';
+
+  /** 可编辑的 910 服务根地址（默认取 NPU_BASE_URL） */
+  @State npuBaseUrl: string = NPU_BASE_URL;
+
+  /** 可编辑的 Bearer token */
+  @State npuToken: string = NPU_BEARER_TOKEN;
+
+  /** 正在请求 910 / 回放元动作序列 */
+  @State isPlanning: boolean = false;
+
+  /** 序列回放中（与 isPlanning 重叠时用于 UI 提示） */
+  @State isPlayingSequence: boolean = false;
+
+  /**
+   * 调试模式：页内展示 910 原始返回；校验通过后不自动执行，需点「下发」。
+   */
+  @State isDebugMode: boolean = false;
+
+  /** 调试区展示的最近一次 910 响应原文 */
+  @State debugResponseText: string = '尚未收到 910 返回。发送到 910 后此处显示原始响应。';
+
+  /** 调试模式下是否有已校验、待下发的元动作 */
+  @State hasPendingDispatch: boolean = false;
+
+  /** 正在麦克风听写（CoreSpeechKit） */
+  @State isVoiceListening: boolean = false;
+
   // -------------------------------------------------------------------------
   // 非 UI 内部状态（不直接驱动布局）
   // -------------------------------------------------------------------------
 
+  /** 语音识别引擎；听写结束或页面销毁时 shutdown */
+  private asrEngine: speechRecognizer.SpeechRecognitionEngine | null = null;
+
+  /** 调试模式缓存的待下发序列（校验已通过） */
+  private pendingActions: MetaAction[] | null = null;
   /** UDP Socket：广播 discover、接收 announce；懒创建 */
   private udp: socket.UDPSocket | null = null;
 
@@ -230,12 +322,17 @@ struct IpDogCtrl {
   private onTcpErrorCb: ((err: BusinessError) => void) | null = null;
 
   /**
+   * 序列回放取消标记：急停/保护时置 true，execute 循环据此中止。
+   */
+  private sequenceCancel: boolean = false;
+
+  /**
    * 页面即将显示。
    * 不在此处 checkAccessToken / requestPermissions：
    * INTERNET 为 system_grant，声明后安装即生效；错误检查 API 可能导致启动异常。
    */
   aboutToAppear(): void {
-    this.log('同网后点「发现设备」（需 module.json5 已声明 INTERNET）');
+    this.log('同网后点「发现设备」；「语音」听写后可发送到 910');
   }
 
   /** 页面销毁：关闭定时器与 UDP/TCP，避免泄漏 */
@@ -736,7 +833,8 @@ struct IpDogCtrl {
       const e = err as BusinessError;
       this.log(`发送失败: ${e.code} ${e.message}`);
       await this.releaseTcpConnection('发送失败，对端可能已断开', false);
-      throw err;
+      // ArkTS 仅允许 throw Error，不能 throw 任意 catch 值
+      throw new Error(`TCP send failed: ${e.code} ${e.message}`);
     }
   }
 
@@ -757,6 +855,9 @@ struct IpDogCtrl {
     this.stopVelLoop();
     this.velTimerId = setInterval(() => {
       if (!this.isAuthed || this.tcp === null || this.tcpReleasing) {
+        return;
+      }
+      if (this.isProtectMode) {
         return;
       }
       if (this.holdFwd === 0 && this.holdSide === 0 && this.holdYaw === 0) {
@@ -807,6 +908,14 @@ struct IpDogCtrl {
    * 切模式锁定期间不更新位置与速度（UI 保持回中）。
    */
   private applyLeftStick(dx: number, dy: number): void {
+    // 保护模式或序列回放中：忽略人工拨杆
+    if (this.isProtectMode || this.isPlayingSequence) {
+      this.leftKnobX = 0;
+      this.leftKnobY = 0;
+      this.holdFwd = 0;
+      this.holdSide = 0;
+      return;
+    }
     if (this.stickVelLocked) {
       this.leftKnobX = 0;
       this.leftKnobY = 0;
@@ -828,6 +937,12 @@ struct IpDogCtrl {
    * 切模式锁定期间不更新位置与速度（UI 保持回中）。
    */
   private applyRightStick(dx: number, dy: number): void {
+    if (this.isProtectMode || this.isPlayingSequence) {
+      this.rightKnobX = 0;
+      this.rightKnobY = 0;
+      this.holdYaw = 0;
+      return;
+    }
     if (this.stickVelLocked) {
       this.rightKnobX = 0;
       this.rightKnobY = 0;
@@ -903,8 +1018,17 @@ struct IpDogCtrl {
     this.tryUnlockStickGate();
   }
 
-  /** 急停：双杆回中并立即发零速度（不进入模式门控） */
+  /**
+   * 急停：进入保护模式。
+   * - 取消元动作序列回放
+   * - 双杆回中并立即发零速度
+   * - 若已鉴权则切阻尼 mode=r
+   * - 锁定摇杆 / 模式键 / 自然语言，直至解除保护
+   */
   private emergencyStop(): void {
+    this.sequenceCancel = true;
+    this.isPlayingSequence = false;
+    this.stopVoiceRecognition(false);
     this.leftKnobX = 0;
     this.leftKnobY = 0;
     this.rightKnobX = 0;
@@ -916,6 +1040,572 @@ struct IpDogCtrl {
     this.rightTouchActive = false;
     this.stickVelLocked = false;
     this.pushVelNow();
+    this.isProtectMode = true;
+    if (this.isAuthed) {
+      // 阻尼：与任务文档保护模式最低要求一致（关节进入阻尼，非锁死）
+      this.sendTcpLine('{"type":"mode","key":"r"}').catch((err: BusinessError) => {
+        console.warn(`${TAG} protect mode r failed: ${err.code}`);
+      });
+    }
+    this.log('保护模式：已零速+阻尼，点「解除保护」后才能继续控制');
+  }
+
+  /** 用户确认安全后退出保护模式 */
+  private clearProtectMode(): void {
+    if (!this.isProtectMode) {
+      return;
+    }
+    this.isProtectMode = false;
+    this.sequenceCancel = false;
+    this.log('已解除保护，可继续控狗 / 发送自然语言');
+  }
+
+  /** Promise 版延时，供序列回放使用 */
+  private sleepMs(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      setTimeout(() => {
+        resolve();
+      }, ms);
+    });
+  }
+
+  /** 速度钳位到手机端上限，超限打日志 */
+  private clampVelAxis(v: number, maxAbs: number, name: string): number {
+    if (v > maxAbs) {
+      this.log(`速度${name} ${v.toFixed(3)} > ${maxAbs}，已钳位`);
+      return maxAbs;
+    }
+    if (v < -maxAbs) {
+      this.log(`速度${name} ${v.toFixed(3)} < ${-maxAbs}，已钳位`);
+      return -maxAbs;
+    }
+    return v;
+  }
+
+  private isValidModeKey(key: string): boolean {
+    for (let i = 0; i < META_MODE_KEYS.length; i++) {
+      if (META_MODE_KEYS[i] === key) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 整单校验元动作；任一非法返回错误文案，合法返回空串。
+   * 不做「过滤后执行」——与任务文档一致。
+   */
+  private validateMetaActions(actions: MetaAction[]): string {
+    if (actions.length === 0) {
+      return 'actions 为空';
+    }
+    for (let i = 0; i < actions.length; i++) {
+      const a = actions[i];
+      if (a.op === 'mode') {
+        if (!this.isValidModeKey(a.key)) {
+          return `第${i + 1}步非法 mode.key=${a.key}`;
+        }
+      } else if (a.op === 'vel') {
+        if (!(a.duration_ms > 0) || Math.floor(a.duration_ms) !== a.duration_ms) {
+          return `第${i + 1}步 vel.duration_ms 非法: ${a.duration_ms}`;
+        }
+        if (!isFinite(a.fwd) || !isFinite(a.side) || !isFinite(a.yaw)) {
+          return `第${i + 1}步 vel 速度非有限数`;
+        }
+      } else {
+        return `第${i + 1}步未知 op=${a.op}`;
+      }
+    }
+    return '';
+  }
+
+  /**
+   * 从 910 响应 JSON 中解析 actions 数组。
+   * 使用轻量扫描，避免复杂依赖；字段缺省按 0 / 空串。
+   */
+  private parseActionsFromResponse(body: string): MetaAction[] | null {
+    const idx = body.indexOf('"actions"');
+    if (idx < 0) {
+      return null;
+    }
+    const lb = body.indexOf('[', idx);
+    if (lb < 0) {
+      return null;
+    }
+    let depth = 0;
+    let rb = -1;
+    for (let i = lb; i < body.length; i++) {
+      const ch = body.charAt(i);
+      if (ch === '[') {
+        depth++;
+      } else if (ch === ']') {
+        depth--;
+        if (depth === 0) {
+          rb = i;
+          break;
+        }
+      }
+    }
+    if (rb < 0) {
+      return null;
+    }
+    const arrText = body.substring(lb + 1, rb);
+    const actions: MetaAction[] = [];
+    // 按顶层 {...} 切分对象
+    let i = 0;
+    while (i < arrText.length) {
+      const start = arrText.indexOf('{', i);
+      if (start < 0) {
+        break;
+      }
+      let d = 0;
+      let end = -1;
+      for (let j = start; j < arrText.length; j++) {
+        const c = arrText.charAt(j);
+        if (c === '{') {
+          d++;
+        } else if (c === '}') {
+          d--;
+          if (d === 0) {
+            end = j;
+            break;
+          }
+        }
+      }
+      if (end < 0) {
+        break;
+      }
+      const obj = arrText.substring(start, end + 1);
+      const a = new MetaAction();
+      a.op = this.extractQuoted(obj, 'op');
+      a.key = this.extractQuoted(obj, 'key');
+      const fwdS = this.extractNumber(obj, 'fwd');
+      const sideS = this.extractNumber(obj, 'side');
+      const yawS = this.extractNumber(obj, 'yaw');
+      const durS = this.extractNumber(obj, 'duration_ms');
+      a.fwd = isNaN(fwdS) ? 0 : fwdS;
+      a.side = isNaN(sideS) ? 0 : sideS;
+      a.yaw = isNaN(yawS) ? 0 : yawS;
+      a.duration_ms = isNaN(durS) ? 0 : Math.floor(durS);
+      actions.push(a);
+      i = end + 1;
+    }
+    return actions;
+  }
+
+  /**
+   * 按文档回放单步 vel：周期发速度，到期发零速。
+   * 保护/取消时立即停。
+   */
+  private async playVelStep(a: MetaAction): Promise<void> {
+    const fwd = this.clampVelAxis(a.fwd, MAX_FWD, 'fwd');
+    const side = this.clampVelAxis(a.side, MAX_SIDE, 'side');
+    const yaw = this.clampVelAxis(a.yaw, MAX_YAW, 'yaw');
+    this.log(`序列 vel fwd=${fwd.toFixed(2)} side=${side.toFixed(2)} yaw=${yaw.toFixed(2)} ${a.duration_ms}ms`);
+    const endAt = Date.now() + a.duration_ms;
+    while (Date.now() < endAt) {
+      if (this.sequenceCancel || this.isProtectMode || !this.isAuthed) {
+        break;
+      }
+      this.holdFwd = fwd;
+      this.holdSide = side;
+      this.holdYaw = yaw;
+      this.pushVelNow();
+      await this.sleepMs(VEL_SEND_MS);
+    }
+    this.holdFwd = 0;
+    this.holdSide = 0;
+    this.holdYaw = 0;
+    this.pushVelNow();
+  }
+
+  /** 按序执行已校验的元动作序列 */
+  private async executeMetaActions(actions: MetaAction[]): Promise<void> {
+    this.sequenceCancel = false;
+    this.isPlayingSequence = true;
+    this.stickVelLocked = true;
+    this.leftKnobX = 0;
+    this.leftKnobY = 0;
+    this.rightKnobX = 0;
+    this.rightKnobY = 0;
+    try {
+      for (let i = 0; i < actions.length; i++) {
+        if (this.sequenceCancel || this.isProtectMode) {
+          this.log(`序列已中止（保护/急停），停在第${i + 1}步前`);
+          break;
+        }
+        if (!this.isAuthed) {
+          this.log('狗机未鉴权，中止序列');
+          break;
+        }
+        const a = actions[i];
+        if (a.op === 'mode') {
+          this.log(`序列 mode=${a.key} (${i + 1}/${actions.length})`);
+          // 直接发 mode，避免 engageModeStickGate 干扰序列速度
+          try {
+            await this.sendTcpLine(`{"type":"mode","key":"${a.key}"}`);
+            await this.sleepMs(200);
+          } catch (_) {
+            this.log('序列 mode 发送失败');
+            break;
+          }
+        } else if (a.op === 'vel') {
+          await this.playVelStep(a);
+        }
+      }
+      if (!this.sequenceCancel && !this.isProtectMode) {
+        this.log('元动作序列执行完成');
+      }
+    } finally {
+      this.holdFwd = 0;
+      this.holdSide = 0;
+      this.holdYaw = 0;
+      this.pushVelNow();
+      this.isPlayingSequence = false;
+      this.stickVelLocked = false;
+    }
+  }
+
+  /** 切换调试模式：开则显示页内返回区；关则清空待下发缓存 */
+  private toggleDebugMode(): void {
+    this.isDebugMode = !this.isDebugMode;
+    if (!this.isDebugMode) {
+      this.clearPendingDispatch();
+      this.log('已退出调试模式');
+    } else {
+      this.log('已进入调试模式：返回值显示在下方，校验通过后需手动「下发」');
+    }
+  }
+
+  private clearPendingDispatch(): void {
+    this.pendingActions = null;
+    this.hasPendingDispatch = false;
+  }
+
+  /** 记录 910 原始返回到调试展示区（始终更新文案，便于随后打开调试也能看到） */
+  private recordDebugResponse(httpCode: number, body: string): void {
+    const clipped = body.length > 8000 ? `${body.substring(0, 8000)}\n…(已截断)` : body;
+    this.debugResponseText = `HTTP ${httpCode}\n────\n${clipped}`;
+  }
+
+  /**
+   * 向 910 请求规划并在本地校验。
+   * 普通模式：已鉴权则自动下发；调试模式：只缓存，等用户点「下发」。
+   */
+  async submitNaturalCommand(): Promise<void> {
+    const text = this.nlText.trim();
+    if (text.length === 0) {
+      this.log('请先输入自然语言指令');
+      return;
+    }
+    if (this.isProtectMode) {
+      this.log('保护模式中，请先解除保护');
+      return;
+    }
+    if (this.isPlanning || this.isPlayingSequence) {
+      this.log('正在规划或执行中，请稍候');
+      return;
+    }
+
+    let base = this.npuBaseUrl.trim();
+    while (base.endsWith('/')) {
+      base = base.substring(0, base.length - 1);
+    }
+    if (base.length === 0) {
+      this.log('请填写 910 服务地址');
+      return;
+    }
+
+    this.clearPendingDispatch();
+    this.isPlanning = true;
+    const requestId = `req-${Date.now()}`;
+    const url = `${base}/v1/plan`;
+    const body =
+      `{"v":1,"request_id":"${requestId}","text":"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"}`;
+    this.log(`请求 910 规划: ${url}${this.isDebugMode ? '（调试·不自动下发）' :
+      (this.isAuthed ? '' : '（未连狗，仅规划）')}`);
+
+    const req = http.createHttp();
+    try {
+      const resp = await req.request(url, {
+        method: http.RequestMethod.POST,
+        header: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.npuToken.trim()}`
+        },
+        extraData: body,
+        expectDataType: http.HttpDataType.STRING,
+        connectTimeout: NPU_CONNECT_TIMEOUT_MS,
+        readTimeout: NPU_READ_TIMEOUT_MS
+      });
+      const code = resp.responseCode;
+      const resultStr: string = typeof resp.result === 'string' ? resp.result : `${resp.result}`;
+      this.recordDebugResponse(code, resultStr);
+      this.log(`910 响应 HTTP ${code}`);
+      if (code < 200 || code >= 300) {
+        this.log(`910 失败: HTTP ${code} ${resultStr.substring(0, 120)}`);
+        return;
+      }
+      const okStr = this.extractQuoted(resultStr, 'ok');
+      const okBool = resultStr.indexOf('"ok":true') >= 0 || resultStr.indexOf('"ok": true') >= 0 ||
+        okStr === 'true';
+      if (!okBool) {
+        const reason = this.extractQuoted(resultStr, 'reason');
+        const msg = this.extractQuoted(resultStr, 'msg');
+        if (reason === 'beyond_capability') {
+          this.log(`超出元操作库能力，不下发: ${msg.length > 0 ? msg : '无详细说明'}`);
+        } else {
+          this.log(`910 ok=false${reason.length > 0 ? ` (${reason})` : ''}: ${msg.length > 0 ? msg : resultStr.substring(0, 120)}`);
+        }
+        return;
+      }
+      const actions = this.parseActionsFromResponse(resultStr);
+      if (actions === null) {
+        this.log('无法解析 actions');
+        return;
+      }
+      const err = this.validateMetaActions(actions);
+      if (err.length > 0) {
+        this.log(`安全拦截，整单拒绝: ${err}`);
+        return;
+      }
+      this.log(`校验通过，共 ${actions.length} 步`);
+      this.logMetaActions(actions);
+
+      if (this.isDebugMode) {
+        this.pendingActions = actions;
+        this.hasPendingDispatch = true;
+        this.log(`调试模式：已缓存 ${actions.length} 步，确认后点「下发到狗」`);
+        return;
+      }
+      if (!this.isAuthed) {
+        this.log('狗机未连接，规划结果仅展示，不下发执行；连接鉴权后可再发或手动控狗');
+        return;
+      }
+      this.log('开始下发执行');
+      await this.executeMetaActions(actions);
+    } catch (e) {
+      const err = e as BusinessError;
+      this.recordDebugResponse(-1, `请求异常 code=${err.code}\nmessage=${err.message}`);
+      this.log(`910 请求异常: ${err.code} ${err.message}`);
+    } finally {
+      try {
+        req.destroy();
+      } catch (_) {
+        // ignore
+      }
+      this.isPlanning = false;
+    }
+  }
+
+  /** 调试模式：将缓存的校验通过序列下发到已鉴权狗机 */
+  private async dispatchPendingToDog(): Promise<void> {
+    if (!this.isDebugMode) {
+      this.log('请先进入调试模式');
+      return;
+    }
+    if (this.isProtectMode) {
+      this.log('保护模式中，无法下发');
+      return;
+    }
+    if (this.isPlayingSequence || this.isPlanning) {
+      this.log('正在规划或执行中，请稍候');
+      return;
+    }
+    if (!this.hasPendingDispatch || this.pendingActions === null || this.pendingActions.length === 0) {
+      this.log('没有可下发的规划结果，请先发送到 910');
+      return;
+    }
+    if (!this.isAuthed) {
+      this.log('狗机未连接，无法下发；请先发现并连接狗机');
+      return;
+    }
+    const actions = this.pendingActions;
+    this.log(`手动下发 ${actions.length} 步到狗机`);
+    await this.executeMetaActions(actions);
+  }
+
+  /** 将规划结果摘要写入日志（未连狗时便于联调查看） */
+  private logMetaActions(actions: MetaAction[]): void {
+    for (let i = 0; i < actions.length; i++) {
+      const a = actions[i];
+      if (a.op === 'mode') {
+        this.log(`  [${i + 1}] mode key=${a.key}`);
+      } else {
+        this.log(
+          `  [${i + 1}] vel fwd=${a.fwd.toFixed(2)} side=${a.side.toFixed(2)} ` +
+            `yaw=${a.yaw.toFixed(2)} dur=${a.duration_ms}ms`
+        );
+      }
+    }
+  }
+
+  /** 申请麦克风权限；已授权则直接 true */
+  private async ensureMicPermission(): Promise<boolean> {
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const atManager = abilityAccessCtrl.createAtManager();
+      const tokenId = context.applicationInfo.accessTokenId;
+      const status = await atManager.checkAccessToken(tokenId, PERM_MICROPHONE);
+      if (status === abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED) {
+        return true;
+      }
+      const result = await atManager.requestPermissionsFromUser(context, [PERM_MICROPHONE]);
+      if (result.authResults.length > 0 &&
+        result.authResults[0] === abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED) {
+        return true;
+      }
+      this.log('未授予麦克风权限，无法语音听写');
+      return false;
+    } catch (e) {
+      const err = e as BusinessError;
+      this.log(`申请麦克风权限失败: ${err.code} ${err.message}`);
+      return false;
+    }
+  }
+
+  /** 释放语音引擎与听写状态 */
+  private stopVoiceRecognition(announce: boolean = true): void {
+    const wasListening = this.isVoiceListening;
+    this.isVoiceListening = false;
+    if (this.asrEngine !== null) {
+      try {
+        this.asrEngine.finish(VOICE_SESSION_ID);
+      } catch (_) {
+        // ignore
+      }
+      try {
+        this.asrEngine.cancel(VOICE_SESSION_ID);
+      } catch (_) {
+        // ignore
+      }
+      try {
+        this.asrEngine.shutdown();
+      } catch (_) {
+        // ignore
+      }
+      this.asrEngine = null;
+    }
+    if (announce && wasListening) {
+      this.log(this.nlText.trim().length > 0 ? `听写结束: ${this.nlText}` : '听写已停止');
+    }
+  }
+
+  /**
+   * 语音按钮：开始 / 停止 CoreSpeechKit 麦克风听写。
+   * 识别中间结果与最终结果写入 nlText；设备不支持时提示改用输入法语音。
+   */
+  private async onVoiceButtonClick(): Promise<void> {
+    if (this.isProtectMode) {
+      this.log('保护模式中，无法语音听写');
+      return;
+    }
+    if (this.isPlanning || this.isPlayingSequence) {
+      this.log('规划或执行中，请稍候再听写');
+      return;
+    }
+    if (this.isVoiceListening) {
+      this.stopVoiceRecognition(true);
+      return;
+    }
+    if (!canIUse('SystemCapability.AI.SpeechRecognizer')) {
+      this.log('本机不支持语音识别引擎，请点指令框用输入法麦克风听写');
+      return;
+    }
+    const ok = await this.ensureMicPermission();
+    if (!ok) {
+      return;
+    }
+
+    try {
+      // 先清掉旧引擎，避免 busy
+      this.stopVoiceRecognition(false);
+
+      const initParams: speechRecognizer.CreateEngineParams = {
+        language: 'zh-CN',
+        online: 1
+      };
+      const engine = await speechRecognizer.createEngine(initParams);
+      this.asrEngine = engine;
+
+      const listener: speechRecognizer.RecognitionListener = {
+        onStart: (_sessionId: string, _msg: string) => {
+          this.isVoiceListening = true;
+          this.log('正在听写，请说话；再点「停止」结束');
+        },
+        onEvent: (_sessionId: string, _code: number, _msg: string) => {
+          // 可选：VAD 等事件
+        },
+        onResult: (_sessionId: string, result: speechRecognizer.SpeechRecognitionResult) => {
+          if (result.result !== undefined && result.result.length > 0) {
+            this.nlText = result.result;
+          }
+          if (result.isLast) {
+            this.isVoiceListening = false;
+            this.log(`听写完成: ${this.nlText}`);
+            // 最终结果后释放引擎，下次重新 create
+            if (this.asrEngine !== null) {
+              try {
+                this.asrEngine.shutdown();
+              } catch (_) {
+                // ignore
+              }
+              this.asrEngine = null;
+            }
+          }
+        },
+        onComplete: (_sessionId: string, _msg: string) => {
+          this.isVoiceListening = false;
+          if (this.asrEngine !== null) {
+            try {
+              this.asrEngine.shutdown();
+            } catch (_) {
+              // ignore
+            }
+            this.asrEngine = null;
+          }
+        },
+        onError: (_sessionId: string, code: number, msg: string) => {
+          this.isVoiceListening = false;
+          this.log(`语音识别错误 ${code}: ${msg}`);
+          if (this.asrEngine !== null) {
+            try {
+              this.asrEngine.shutdown();
+            } catch (_) {
+              // ignore
+            }
+            this.asrEngine = null;
+          }
+        }
+      };
+      engine.setListener(listener);
+
+      const audioInfo: speechRecognizer.AudioInfo = {
+        audioType: 'pcm',
+        sampleRate: 16000,
+        soundChannel: 1,
+        sampleBit: 16
+      };
+      const extraParams: Record<string, Object> = {
+        'recognitionMode': 0,
+        'vadBegin': 2000,
+        'vadEnd': 3000,
+        'maxAudioDuration': 20000
+      };
+      const startParams: speechRecognizer.StartParams = {
+        sessionId: VOICE_SESSION_ID,
+        audioInfo: audioInfo,
+        extraParams: extraParams
+      };
+      this.isVoiceListening = true;
+      this.log('正在听写，请说话…');
+      engine.startListening(startParams);
+    } catch (e) {
+      this.isVoiceListening = false;
+      this.asrEngine = null;
+      const err = e as BusinessError;
+      this.log(`启动语音识别失败: ${err.code} ${err.message}；也可点指令框用输入法麦克风`);
+    }
   }
 
   /** 从 TouchEvent 取相对摇杆中心的偏移 */
@@ -932,6 +1622,14 @@ struct IpDogCtrl {
    * 先强制摇杆回中并锁定，再发 mode，与狗端「清零 + 忽略杆量直到回中」对齐。
    */
   async sendModeKey(key: string): Promise<void> {
+    if (this.isProtectMode) {
+      this.log('保护模式中，无法切模式');
+      return;
+    }
+    if (this.isPlayingSequence) {
+      this.log('序列执行中，请稍候或急停');
+      return;
+    }
     if (!this.isAuthed) {
       this.log('尚未鉴权');
       return;
@@ -999,6 +1697,10 @@ struct IpDogCtrl {
    * 发现定时器 → 速度环 → TCP → UDP 监听与关闭。
    */
   async cleanupAll(): Promise<void> {
+    this.sequenceCancel = true;
+    this.isPlayingSequence = false;
+    this.isPlanning = false;
+    this.stopVoiceRecognition(false);
     if (this.discoverTimerId >= 0) {
       clearTimeout(this.discoverTimerId);
       this.discoverTimerId = -1;
@@ -1019,6 +1721,12 @@ struct IpDogCtrl {
 
   /** 连接状态文案 */
   private statusLabel(): string {
+    if (this.isProtectMode) {
+      return '保护模式 · 急停锁定';
+    }
+    if (this.isPlayingSequence) {
+      return '元动作序列执行中…';
+    }
     if (this.isAuthed) {
       return this.connectedLabel;
     }
@@ -1028,8 +1736,11 @@ struct IpDogCtrl {
     return '未连接 · 同网后发现设备';
   }
 
-  /** 状态指示色：已鉴权青绿 / 连接中琥珀 / 未连接灰 */
+  /** 状态指示色：保护红 / 已鉴权青绿 / 连接中琥珀 / 未连接灰 */
   private statusColor(): string {
+    if (this.isProtectMode) {
+      return '#DC2626';
+    }
     if (this.isAuthed) {
       return '#0F766E';
     }
@@ -1194,7 +1905,7 @@ struct IpDogCtrl {
   }
 
   /**
-   * 页面布局：品牌头 → 可滚区 → 底部固定双摇杆
+   * 页面布局：品牌头 → 可滚区 → 底部固定双摇杆。
    */
   build() {
     Column() {
@@ -1207,7 +1918,7 @@ struct IpDogCtrl {
               .fontWeight(FontWeight.Bold)
               .fontColor('#0F1C24')
               .letterSpacing(0.6)
-            Text('局域网控狗 · 双摇杆')
+            Text('局域网控狗 · 端云自然语言')
               .fontSize(13)
               .fontColor('#64748B')
               .margin({ top: 4 })
@@ -1347,6 +2058,186 @@ struct IpDogCtrl {
                 }, (dog: DogDevice) => dog.key)
               }
             }
+          }
+          .width('100%')
+          .alignItems(HorizontalAlign.Start)
+
+          // —— 端云 910：自然语言 → 元动作 ——
+          Column() {
+            Row() {
+              Column() {
+                this.SectionLabel('端云规划', '910 · /v1/plan')
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
+              Button(this.isDebugMode ? '退出调试' : '调试模式')
+                .height(32)
+                .fontSize(12)
+                .fontColor(this.isDebugMode ? '#FFFFFF' : '#0F766E')
+                .backgroundColor(this.isDebugMode ? '#0F766E' : '#FFFFFF')
+                .borderRadius(8)
+                .border({ width: 1, color: '#0F766E' })
+                .padding({ left: 12, right: 12 })
+                .onClick(() => {
+                  this.toggleDebugMode();
+                })
+            }
+            .width('100%')
+            .alignItems(VerticalAlign.Center)
+            .margin({ bottom: 4 })
+            if (this.isDebugMode) {
+              Column({ space: 8 }) {
+                Text('910 返回（调试）')
+                  .fontSize(12)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor('#0F766E')
+                  .width('100%')
+                Scroll() {
+                  Text(this.debugResponseText)
+                    .fontSize(12)
+                    .fontColor('#334155')
+                    .width('100%')
+                }
+                .width('100%')
+                .height(140)
+                .scrollBar(BarState.Auto)
+                .padding(10)
+                .backgroundColor('#F1F5F9')
+                .borderRadius(10)
+                .border({ width: 1, color: '#CBD5E1' })
+                Row({ space: 10 }) {
+                  Button('清空返回')
+                    .layoutWeight(1)
+                    .height(40)
+                    .fontSize(13)
+                    .fontColor('#0F1C24')
+                    .backgroundColor('#FFFFFF')
+                    .borderRadius(10)
+                    .border({ width: 1, color: '#CBD5E1' })
+                    .onClick(() => {
+                      this.debugResponseText = '（已清空）等待下一次 910 返回…';
+                    })
+                  Button(this.hasPendingDispatch ? '下发到狗' : '下发到狗（无缓存）')
+                    .layoutWeight(1)
+                    .height(40)
+                    .fontSize(13)
+                    .fontColor('#FFFFFF')
+                    .backgroundColor((this.hasPendingDispatch && this.isAuthed && !this.isProtectMode &&
+                      !this.isPlayingSequence) ? '#0F766E' : '#94A3B8')
+                    .borderRadius(10)
+                    .enabled(this.hasPendingDispatch && this.isAuthed && !this.isProtectMode &&
+                      !this.isPlayingSequence && !this.isPlanning)
+                    .onClick(() => {
+                      this.dispatchPendingToDog();
+                    })
+                }
+                .width('100%')
+                Text(this.hasPendingDispatch ?
+                  (this.isAuthed ? '已校验，可下发到狗' : '已校验，请先连接狗机再下发') :
+                  '发送到 910 并校验通过后才会启用「下发到狗」')
+                  .fontSize(11)
+                  .fontColor('#64748B')
+                  .width('100%')
+              }
+              .width('100%')
+              .padding(12)
+              .margin({ bottom: 10 })
+              .backgroundColor('#ECFDF5')
+              .borderRadius(12)
+              .border({ width: 1, color: '#99F6E4' })
+              .alignItems(HorizontalAlign.Start)
+            }
+            if (this.isProtectMode) {
+              Row({ space: 10 }) {
+                Text('保护模式已启用：零速 + 阻尼，控制已锁定')
+                  .fontSize(12)
+                  .fontColor('#7F1D1D')
+                  .layoutWeight(1)
+                Button('解除保护')
+                  .height(36)
+                  .fontSize(13)
+                  .fontColor('#FFFFFF')
+                  .backgroundColor('#DC2626')
+                  .borderRadius(10)
+                  .onClick(() => {
+                    this.clearProtectMode();
+                  })
+              }
+              .width('100%')
+              .padding(12)
+              .backgroundColor('#FEE2E2')
+              .borderRadius(12)
+              .margin({ bottom: 10 })
+            }
+            TextInput({ placeholder: '中间机地址，如 http://192.168.x.x:8443', text: this.npuBaseUrl })
+              .height(42)
+              .fontSize(13)
+              .backgroundColor('#FFFFFF')
+              .borderRadius(10)
+              .border({ width: 1, color: '#E2E8F0' })
+              .padding({ left: 12, right: 12 })
+              .onChange((v: string) => {
+                this.npuBaseUrl = v;
+              })
+            TextInput({ placeholder: 'Bearer token', text: this.npuToken })
+              .height(42)
+              .fontSize(13)
+              .margin({ top: 8 })
+              .backgroundColor('#FFFFFF')
+              .borderRadius(10)
+              .border({ width: 1, color: '#E2E8F0' })
+              .padding({ left: 12, right: 12 })
+              .onChange((v: string) => {
+                this.npuToken = v;
+              })
+            TextArea({ placeholder: '自然语言指令，例如：向前走两米再坐下', text: this.nlText })
+              .height(88)
+              .fontSize(14)
+              .margin({ top: 8 })
+              .backgroundColor('#FFFFFF')
+              .borderRadius(10)
+              .border({ width: 1, color: '#E2E8F0' })
+              .padding(10)
+              .onChange((v: string) => {
+                this.nlText = v;
+              })
+            Row({ space: 10 }) {
+              Button(this.isVoiceListening ? '停止' : '语音')
+                .layoutWeight(1)
+                .height(44)
+                .fontSize(14)
+                .fontColor(this.isVoiceListening ? '#FFFFFF' : '#0F1C24')
+                .backgroundColor(this.isVoiceListening ? '#DC2626' : '#FFFFFF')
+                .borderRadius(12)
+                .border({ width: 1, color: this.isVoiceListening ? '#DC2626' : '#CBD5E1' })
+                .enabled(!this.isProtectMode && !this.isPlanning && !this.isPlayingSequence)
+                .onClick(() => {
+                  this.onVoiceButtonClick();
+                })
+              Button(this.isPlayingSequence ? '执行中…' : (this.isPlanning ? '规划中…' : '发送到 910'))
+                .layoutWeight(2)
+                .height(44)
+                .fontSize(15)
+                .fontWeight(FontWeight.Medium)
+                .fontColor('#FFFFFF')
+                .backgroundColor((this.isPlanning || this.isPlayingSequence || this.isProtectMode ||
+                  this.isVoiceListening) ? '#94A3B8' : '#0F766E')
+                .borderRadius(12)
+                .enabled(!this.isPlanning && !this.isPlayingSequence && !this.isProtectMode &&
+                  !this.isVoiceListening)
+                .onClick(() => {
+                  this.submitNaturalCommand();
+                })
+            }
+            .width('100%')
+            .margin({ top: 10 })
+            Text(this.isDebugMode ?
+              '调试中：返回显示在上方框内；校验通过后需点「下发到狗」。退出调试可恢复自动下发。' :
+              '点「调试模式」可在页内查看 910 返回并手动下发。普通模式已连狗时会自动执行。')
+              .fontSize(11)
+              .fontColor('#94A3B8')
+              .margin({ top: 8 })
+              .width('100%')
           }
           .width('100%')
           .alignItems(HorizontalAlign.Start)

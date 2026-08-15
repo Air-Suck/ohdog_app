@@ -1,0 +1,25 @@
+# Ascend 910 薄规划服务自启动（openEuler / systemd）
+# 使用前请把 WorkingDirectory / ExecStart 改成服务器上的真实路径。
+#
+#   sudo cp scripts/npu_plan_server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now npu_plan_server
+
+[Unit]
+Description=RoboPi NPU plan thin server (910)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ma-user
+WorkingDirectory=/home/ma-user/910_server
+Environment=NPU_PORT=8443
+Environment=NPU_TOKEN=robotpi
+# 连通性阶段默认明文 HTTP；上 TLS 后改为不带 --http，并设置 NPU_CERT/NPU_KEY
+ExecStart=/home/ma-user/910_server/npu_plan_server --http --port 8443 --token robotpi
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
