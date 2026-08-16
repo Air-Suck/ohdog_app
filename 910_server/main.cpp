@@ -307,14 +307,27 @@ static const char kMetaActionSystemPrompt[] = R"META(
    duration_ms 必须为 >0 的整数；建议 |fwd|≤0.7、|side|≤0.5、|yaw|≤0.7
    距离类指令用「名义速度×时长」近似，勿发明 distance 字段
 
+【自然语言别名 → mode.key】常见中文口令必须映射到已有 key，不得当作未定义动作或 beyond_capability：
+- 坐下 / 趴下 / 阻尼 / 放松关节 / 空闲 / 待机 → key "r"（阻尼；口语「空闲/待机」也用 r，禁止输出 key=x）
+- 站立 / 起立 / 站起来 → key "z"
+- 行走 / 走路 / 开始走 → key "v"（非零 vel 前常先切 v）
+- 跳跃 / 跳一下 → key "j"
+- 后空翻 / 翻个跟头 → key "b"
+- 打招呼 / 打个招呼 / 招手 / 挥手 → key "k"（挥手姿态，不是语音对话）
+
 【规划约束】
 - 非零 vel 前通常先 {"op":"mode","key":"v"}；结束可视需要切回阻尼 {"op":"mode","key":"r"}（勿用 x）
 - 能用字典完成时：只输出一个 JSON 数组（不要 markdown、不要解释），例如：
   [{"op":"mode","key":"v"},{"op":"vel","fwd":0.4,"side":0.0,"yaw":0.0,"duration_ms":5000},{"op":"mode","key":"r"}]
+- 姿态/手势正例（直接输出数组即可）：
+  坐下 → [{"op":"mode","key":"r"}]
+  打个招呼 → [{"op":"mode","key":"k"}]
+  站起来 → [{"op":"mode","key":"z"}]
 
 【超出能力】
-若任务无法仅用上述 mode/vel 可靠完成（例如：开门、抓取、飞行、游泳、精确地图导航、语音对话、识别特定物体后操作、爬楼梯闭环等），
-则不要输出 actions 数组，只输出下面这个 JSON 对象（不要 markdown）：
+beyond_capability 仅用于真正无法用 mode/vel 完成的任务（例如：开门、抓取、飞行、游泳、精确地图导航到某地、语音说话/对话聊天、识别特定物体后操作、爬楼梯闭环等）。
+坐下、趴下、打招呼、招手、站立、行走、跳跃、后空翻等常见狗姿态/手势口令属于上表别名，必须输出对应 mode，禁止 beyond_capability。
+若确属超出能力，则不要输出 actions 数组，只输出下面这个 JSON 对象（不要 markdown）：
   {"ok":false,"reason":"beyond_capability","msg":"<简短中文说明：缺什么能力、为何做不到>"}
 )META";
 
