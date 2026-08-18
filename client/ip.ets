@@ -131,6 +131,33 @@ const NPU_READ_TIMEOUT_MS: number = 60000;
 const META_MODE_KEYS: string[] = ['r', 'z', 'v', 'b', 'j', 'k'];
 
 /**
+ * 序列回放时，每条 mode 发完后等待的毫秒数。
+ * 狗端同一时刻只接受一个技能；间隔过短时后一条会覆盖前一条。
+ * 手动点按键能成功，是因为人两次点击之间 naturally 隔了数秒。
+ */
+function modeDwellMs(key: string): number {
+  if (key === 'b') {
+    return 5000; // 后空翻
+  }
+  if (key === 'j') {
+    return 3500; // 跳跃
+  }
+  if (key === 'k') {
+    return 3500; // 挥手 / 打招呼
+  }
+  if (key === 'z') {
+    return 2500; // 站立到位后再接下一个技能
+  }
+  if (key === 'v') {
+    return 800; // 切入行走
+  }
+  if (key === 'r') {
+    return 600; // 阻尼
+  }
+  return 1500;
+}
+
+/**
  * 控制外设类型（与狗端 types::RemoteCommandType 数值一致）。
  * switch 报文的 mode 字段使用这些常量。
  */
@@ -1072,6 +1099,18 @@ struct IpDogCtrl {
     });
   }
 
+  /** 可被急停/保护模式打断的等待，避免技能等待期间无法中止序列 */
+  private async sleepMsInterruptible(ms: number): Promise<void> {
+    const endAt = Date.now() + ms;
+    while (Date.now() < endAt) {
+      if (this.sequenceCancel || this.isProtectMode) {
+        return;
+      }
+      const remain = endAt - Date.now();
+      await this.sleepMs(remain > 100 ? 100 : remain);
+    }
+  }
+
   /** 速度钳位到手机端上限，超限打日志 */
   private clampVelAxis(v: number, maxAbs: number, name: string): number {
     if (v > maxAbs) {
@@ -1247,7 +1286,9 @@ struct IpDogCtrl {
           // 直接发 mode，避免 engageModeStickGate 干扰序列速度
           try {
             await this.sendTcpLine(`{"type":"mode","key":"${a.key}"}`);
-            await this.sleepMs(200);
+            const dwell = modeDwellMs(a.key);
+            this.log(`等待 mode=${a.key} 完成 ${dwell}ms`);
+            await this.sleepMsInterruptible(dwell);
           } catch (_) {
             this.log('序列 mode 发送失败');
             break;
